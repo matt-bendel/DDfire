@@ -1,4 +1,4 @@
-# Solving Inverse Problems using Diffusion with Fast Iterative Renoising
+# Solving Inverse Problems using Diffusion with Fast Iterative Renoising [[arXiv]](https://arxiv.org/pdf/2501.17468)
 
 Official PyTorch implementation of Solving Inverse Problems using Diffusion with Fast Iterative Renoising. Code modified from DPS.
 
