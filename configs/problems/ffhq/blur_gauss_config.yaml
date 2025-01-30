@@ -1,0 +1,27 @@
+deg: "blur_gauss"
+
+noisy:
+  20:
+    K: 10
+    delta_1: 0.50
+
+  100:
+    K: 50
+    delta_1: 0.5
+
+  1000:
+    K: 500
+    delta_1: 0.5
+
+noiseless:
+  20:
+    K: 10
+    delta_1: 0.25
+
+  100:
+    K: 50
+    delta_1: 0.25
+
+  1000:
+    K: 500
+    delta_1: 0.1

@@ -1,0 +1,14 @@
+full_data_path: "/storage/ImageNet"
+fire_out: "TODO"
+
+test_start: 0
+test_end: 1000
+
+tune_start: 2000
+tune_end: 2100
+
+batch_size: 5
+image_size: 256
+preprocess: True
+
+sqrt_in_var_to_out: "eta_scale/imagenet.npy"

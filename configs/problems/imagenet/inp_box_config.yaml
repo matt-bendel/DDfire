@@ -1,0 +1,14 @@
+deg: "inp_box"
+
+noisy:
+  20:
+    K: 10
+    delta_1: 0.5
+
+  100:
+    K: 10
+    delta_1: 0.5
+
+  1000:
+    K: 100
+    delta_1: 0.5

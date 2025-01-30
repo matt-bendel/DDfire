@@ -1,0 +1,14 @@
+full_data_path: "/storage/FFHQ/ffhq256"
+fire_out: "TODO"
+
+test_start: 69000
+test_end: 70000
+
+tune_start: 0
+tune_end: 1000
+
+batch_size: 5
+image_size: 256
+preprocess: False
+
+sqrt_in_var_to_out: "eta_scale/ffhq.npy"
