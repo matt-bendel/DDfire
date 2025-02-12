@@ -36,7 +36,9 @@ def create_sampler(sampler,
                    timestep_respacing="",
                    eta=1.0,
                    delta_1=0.25,
-                   nfe_budget=100):
+                   nfe_budget=100,
+                   clamp_denoise=True,
+                   clamp_fire_ddim=True):
     sampler = get_sampler(name=sampler)
 
     betas = get_named_beta_schedule(noise_schedule, steps)
@@ -57,7 +59,9 @@ def create_sampler(sampler,
                    clip_denoised=clip_denoised,
                    rescale_timesteps=rescale_timesteps,
                    delta_1=delta_1,
-                   nfe_budget=nfe_budget)
+                   nfe_budget=nfe_budget,
+                   clamp_denoise=clamp_denoise,
+                   clamp_fire_ddim=clamp_fire_ddim)
 
 
 class GaussianDiffusion:
@@ -70,7 +74,9 @@ class GaussianDiffusion:
                  clip_denoised,
                  rescale_timesteps,
                  delta_1=0.1,
-                 nfe_budget=100
+                 nfe_budget=100,
+                 clamp_denoise=True,
+                 clamp_fire_ddim=True
                  ):
 
         # use float64 for accuracy.
@@ -119,6 +125,9 @@ class GaussianDiffusion:
 
         self.var_processor = get_var_processor(model_var_type,
                                                betas=betas)
+
+        self.clamp_denoise = clamp_denoise
+        self.clamp_fire_ddim = clamp_fire_ddim
 
     def q_mean_variance(self, x_start, t):
         """
@@ -190,7 +199,7 @@ class GaussianDiffusion:
         img = x_start
         device = x_start.device
 
-        fire_runner = FIRE(model, self.alphas_cumprod_model, x_start, H, sqrt_in_var_to_out)
+        fire_runner = FIRE(model, self.alphas_cumprod_model, x_start, H, sqrt_in_var_to_out, self.clamp_denoise)
         fire_runner.rho = self.rho
 
         pbar = tqdm(list(range(self.num_timesteps))[::-1])
@@ -444,23 +453,24 @@ class DDIM(SpacedDiffusion):
 
     def p_sample(self, model, x, t, y, cond, fire, noise_sig, eta=0.85):
         out = self.denoise(model, x, t, y, cond, fire, noise_sig)
+        pred_x0 = out['pred_xstart']
+        if self.clamp_fire_ddim:
+            pred_x0 = pred_x0.clamp(min=-1., max=1.)
 
         alpha_bar = extract_and_expand(self.alphas_cumprod, t, x)
         alpha_bar_prev = extract_and_expand(self.alphas_cumprod_prev, t, x)
-        sigma = (
-                eta
-                * torch.sqrt((1 - alpha_bar_prev) / (1 - alpha_bar))
-                * torch.sqrt(1 - alpha_bar / alpha_bar_prev)
-        )
 
-        c = torch.sqrt((1 - alpha_bar_prev - sigma ** 2) / (1 - alpha_bar))
+        c1 = eta * ((1 - alpha_bar / alpha_bar_prev) * (1 - alpha_bar_prev) / (1 - alpha_bar)).sqrt()
+        c2 = ((1 - alpha_bar_prev) - c1 ** 2).sqrt()
 
-        # Equation 12.
+        eps_t = (x - pred_x0 * alpha_bar.sqrt()) / (1 - alpha_bar).sqrt()
+
         noise = torch.randn_like(x)
 
-        sample = c * x + (alpha_bar_prev.sqrt() - c * alpha_bar.sqrt()) * out['pred_xstart']
+        sample = alpha_bar_prev.sqrt() * pred_x0.clamp(min=-1., max=1.)
+        sample += c2 * eps_t
         if t[0] != 0:
-            sample += sigma * noise
+            sample += c1 * noise
 
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 

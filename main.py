@@ -36,6 +36,8 @@ def main():
     parser.add_argument('--data_config', type=str)
     parser.add_argument('--problem_config', type=str)
     parser.add_argument('--noiseless', action='store_true')
+    parser.add_argument('--clamp-denoise', action='store_true')
+    parser.add_argument('--clamp-fire-ddim', action='store_true')
     parser.add_argument('--sig_y', type=float, default=0.05)
     parser.add_argument('--nfes', type=int, default=100)
     parser.add_argument('--seed', type=int, default=1)
@@ -73,7 +75,7 @@ def main():
     model.eval()
 
     # Load diffusion sampler
-    sampler = create_sampler(**diffusion_config, delta_1=problem_config["noiseless" if args.noiseless else "noisy"][args.nfes]["delta_1"], nfe_budget=args.nfes)
+    sampler = create_sampler(**diffusion_config, delta_1=problem_config["noiseless" if args.noiseless else "noisy"][args.nfes]["delta_1"], nfe_budget=args.nfes, clamp_denoise=args.clamp_denoise, clamp_fire_ddim=args.clamp_fire_ddim)
     sample_fn = partial(sampler.p_sample_loop, model=model)
 
     dm = ImageDataModule(data_config)

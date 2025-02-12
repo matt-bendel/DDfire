@@ -17,7 +17,7 @@ def normalize_np(img):
 
 
 class FIRE:
-    def __init__(self, model, alphas_cumprod, x_T, H, sqrt_in_var_to_out):
+    def __init__(self, model, alphas_cumprod, x_T, H, sqrt_in_var_to_out, clamp_denoise):
         self.model = model
         self.alphas_cumprod = alphas_cumprod
         self.power = 0.5
@@ -33,6 +33,8 @@ class FIRE:
 
         self.rho = 1.25
         self.max_iters = 50
+
+        self.clamp_denoise = clamp_denoise
 
         with open(sqrt_in_var_to_out, 'rb') as f:
             self.sqrt_in_variance_to_out = torch.from_numpy(np.load(f)).to(x_T.device)
@@ -120,7 +122,8 @@ class FIRE:
 
         # Denoise
         mu_2, true_noise_var, used_t = self.uncond_denoiser_function(mu_1.float(), noise_var)
-        mu_2 = mu_2.clamp(min=-1, max=1)
+        if self.clamp_denoise:
+            mu_2 = mu_2.clamp(min=-1, max=1)
 
         eta_2 = 1 / (self.sqrt_in_variance_to_out[used_t[0]] * true_noise_var[0].unsqueeze(0).sqrt().repeat(mu_2.shape[0], 1)).float()
 
@@ -173,6 +176,7 @@ class FIRE:
             tr_approx = tr_approx / num_samps
             y_m_A_mu_2 = torch.sum((y - self.H.H(mu_2)) ** 2, dim=1).unsqueeze(1)
             eta = tr_approx / (y_m_A_mu_2 - m / gamma_w)
+            eta = eta.float()
 
             # 2. Linear Estimation
             mu_1 = self.linear_estimation(mu_2 * eta[:, 0, None, None, None], y, gamma_w, eta)
@@ -182,7 +186,7 @@ class FIRE:
 
             self.cg_initialization = mu_1.clone() # CG warm start
 
-        return mu_1.clamp(min=-1., max=1.).float()
+        return mu_1.float()
 
 
 def extract_and_expand(array, time, target):

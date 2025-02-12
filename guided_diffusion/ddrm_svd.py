@@ -84,12 +84,9 @@ def get_operator(problem_config, data_config, device):
             # re normalize the vector
             b_k = b_k1 / b_k1_norm
 
-        s_max = torch.sqrt(H.Ht(H.H(b_k)) / b_k)
+        s_max = torch.sqrt(torch.linalg.norm(H.Ht(H.H(b_k))))
 
-        if torch.isnan(s_max).any():
-            H.s_max = 1.0
-        else:
-            H.s_max = s_max[0, 0].cpu().numpy()
+        H.s_max = s_max.cpu().numpy()
 
     return H
 
