@@ -2,22 +2,54 @@ from functools import partial
 import argparse
 import yaml
 import types
-import lpips
 import os
 import torch
 import matplotlib.pyplot as plt
 import numpy as np
 
 from guided_diffusion.unet import create_model
-from guided_diffusion.fire_ddim import create_sampler
+from guided_diffusion.DDfire import DDfire
 
 from util.img_utils import clear_color
 from util.logger import get_logger
 from data.ImageDataModule import ImageDataModule
 
 from pytorch_lightning import seed_everything
-from guided_diffusion.ddrm_svd import get_operator, Deblurring
-from torchmetrics.functional import peak_signal_noise_ratio
+from guided_diffusion.ddrm_svd import get_operator
+from torch.multiprocessing import Process
+import torch.multiprocessing as mp
+
+def all_gather(tensor, log=None):
+    if log: log.info("Gathering tensor across {} devices... ".format(dist.get_world_size()))
+    gathered_tensors = [
+        torch.zeros_like(tensor) for _ in range(dist.get_world_size())
+    ]
+    with torch.no_grad():
+        dist.all_gather(gathered_tensors, tensor)
+    return gathered_tensors
+
+
+def collect_all_subset(psnr, lpips):
+    gathered_psnr = all_gather(psnr)
+    gathered_lpips = all_gather(lpips)
+
+    return gathered_psnr, gathered_lpips
+
+
+def init_processes(rank, size, fn, args):
+    """ Initialize the distributed environment. """
+    os.environ['MASTER_ADDR'] = args.master_address
+    os.environ['MASTER_PORT'] = f'{args.port}'
+    torch.cuda.set_device(args.local_rank)
+    dist.init_process_group(backend='nccl', init_method='env://', rank=rank, world_size=size)
+    fn(args)
+    dist.barrier()
+    cleanup()
+
+
+def cleanup():
+    dist.destroy_process_group()
+
 
 def load_object(dct):
     return types.SimpleNamespace(**dct)
@@ -29,20 +61,7 @@ def load_yaml(file_path: str) -> dict:
     return config
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model_config', type=str)
-    parser.add_argument('--diffusion_config', type=str)
-    parser.add_argument('--data_config', type=str)
-    parser.add_argument('--problem_config', type=str)
-    parser.add_argument('--noiseless', action='store_true')
-    parser.add_argument('--clamp-denoise', action='store_true')
-    parser.add_argument('--clamp-fire-ddim', action='store_true')
-    parser.add_argument('--sig_y', type=float, default=0.05)
-    parser.add_argument('--nfes', type=int, default=100)
-    parser.add_argument('--seed', type=int, default=1)
-    parser.add_argument('--gpu', type=int, default=0)
-    args = parser.parse_args()
+def main(args):
     seed_everything(args.seed, workers=True)
 
     # logger
@@ -58,9 +77,7 @@ def main():
     diffusion_config = load_yaml(args.diffusion_config)
     problem_config = load_yaml(args.problem_config)
     data_config = load_yaml(args.data_config)
-
-    diffusion_config["timestep_respacing"] = f'ddim{args.nfes}'
-    diffusion_config["timestep_respacing"] = [f'ddim{args.nfes}', f'{problem_config["noiseless" if args.noiseless else "noisy"][args.nfes]["K"]}']
+    fire_config = load_yaml(args.fire_config)
 
     if args.nfes < 100:
         diffusion_config["eta"] = 0.5
@@ -74,9 +91,15 @@ def main():
     model = model.to(device)
     model.eval()
 
+    beta_start = 0.0001
+    beta_end = 0.02
+    model_betas = np.linspace(
+        beta_start, beta_end, 1000, dtype=np.float64
+    )
+
     # Load diffusion sampler
-    sampler = create_sampler(**diffusion_config, delta_1=problem_config["noiseless" if args.noiseless else "noisy"][args.nfes]["delta_1"], nfe_budget=args.nfes, clamp_denoise=args.clamp_denoise, clamp_fire_ddim=args.clamp_fire_ddim)
-    sample_fn = partial(sampler.p_sample_loop, model=model)
+    sampler = DDfire(fire_config, torch.ones(data_config["batch_size"], 3, 256, 256).to(device), model, model_betas, A, problem_config['K'],
+           problem_config['delta'], problem_config['eta'], N_tot=args.nfes, quantize_ddim=False)
 
     dm = ImageDataModule(data_config)
 
@@ -86,16 +109,16 @@ def main():
     H = get_operator(problem_config, data_config, device)
 
     os.makedirs(data_config["fire_out"] + f'/{args.nfes}/{problem_config["deg"]}{"" if args.noiseless else "_noisy"}/' + 'samples', exist_ok=True)
-
-    loss_fn_vgg = lpips.LPIPS(net='vgg').cuda()
-    lpips_vals = []
-    psnr_vals = []
+    os.makedirs(data_config["fire_out"] + f'/{args.nfes}/{problem_config["deg"]}{"" if args.noiseless else "_noisy"}/' + 'x', exist_ok=True)
 
     for i, data in enumerate(test_loader):
         logger.info(f"Inference for image {i}")
-        # Different motion blur operator for each batch
+        # Different motion blur operator for each batch - in paper we use fixed blur kernel
         if problem_config["deg"] == 'blur_motion':
             H = get_operator(problem_config, data_config, device)
+
+        if i % args.gpus != args.local_rank and args.gpus > 1:
+            continue
 
         x = data[0]
         x = x.to(device)
@@ -107,18 +130,57 @@ def main():
         # Sampling
         with torch.no_grad():
             x_start = torch.randn(x.shape, device=device)
-            sample, nfes = sample_fn(x_start=x_start, measurement=y_n, noise_sig=sig_y, eta=diffusion_config["eta"], H=H, sqrt_in_var_to_out=data_config["sqrt_in_var_to_out"])
-
-            lpips_vals.append(loss_fn_vgg(sample, x).mean().detach().cpu().numpy())
-            psnr_vals.append(peak_signal_noise_ratio(sample, x).mean().detach().cpu().numpy())
+            sample = sampler.p_sample_loop(x_start, y_n, sig_y)
+            dist.barrier()
 
             for j in range(sample.shape[0]):
                 plt.imsave(f'{data_config["fire_out"]}/{args.nfes}/{problem_config["deg"]}{"" if args.noiseless else "_noisy"}/samples/image_{i * data_config["batch_size"] + j}.png', clear_color(sample[j].unsqueeze(0)))
-
-
-    print(f'Avg. LPIPS: {np.mean(lpips_vals)} +/- {np.std(lpips_vals) / len(lpips_vals)}')
-    print(f'Avg. PSNR: {np.mean(psnr_vals)} +/- {np.std(psnr_vals) / len(psnr_vals)}')
+                plt.imsave(f'{data_config["fire_out"]}/{args.nfes}/{problem_config["deg"]}{"" if args.noiseless else "_noisy"}/x/x_{i * data_config["batch_size"] + j}.png', clear_color(x[j].unsqueeze(0)))
 
 
 if __name__ == '__main__':
-    main()
+    mp.set_start_method('spawn')
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_config', type=str)
+    parser.add_argument('--diffusion_config', type=str)
+    parser.add_argument('--data_config', type=str)
+    parser.add_argument('--problem_config', type=str)
+    parser.add_argument('--fire_config', type=str)
+    parser.add_argument('--noiseless', action='store_true')
+    parser.add_argument('--sig_y', type=float, default=0.05)
+    parser.add_argument('--nfes', type=int, default=1000)
+    parser.add_argument('--seed', type=int, default=1)
+    parser.add_argument('--gpus', type=int, default=1)
+    parser.add_argument('--master_address', type=str, default='localhost')
+    parser.add_argument('--gpus', type=int, default=1)
+    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--global_rank', type=int, default=0)
+    parser.add_argument('--global_size', type=int, default=1)
+    parser.add_argument('--port', type=int, default=6010)
+    args = parser.parse_args()
+
+    if args.gpus > 1:
+        size = args.gpus
+
+        processes = []
+        for rank in range(size):
+            args = copy.deepcopy(args)
+            args.local_rank = rank
+            global_rank = rank  # single node assumed
+            global_size = size
+            args.global_rank = rank
+            args.global_size = size
+            print('local proc %d, global proc %d, global_size %d, port %d' % (rank, global_rank, global_size, args.port))
+            p = Process(target=init_processes, args=(global_rank, global_size, main, args))
+            p.start()
+            processes.append(p)
+
+        for p in processes:
+            p.join()
+    else:
+        torch.cuda.set_device(0)
+        args.global_rank = 0
+        args.local_rank = 0
+        args.global_size = 1
+        init_processes(0, 1, main, args)

@@ -17,4 +17,4 @@ resblock_updown: True
 use_fp16: False
 use_new_attention_order: False
 
-model_path: /storage/matt_models/dps/ffhq_10m.pt
+model_path: /path/to/weights/ffhq_10m.pt # TODO

@@ -6,91 +6,6 @@ from scipy.stats import multivariate_normal
 from util.img_utils import Blurkernel, fft2_m
 from motionblur.motionblur import Kernel
 
-
-def get_operator(problem_config, data_config, device):
-    accepted_operators = ['sr_bicubic4', 'sr_bicubic8', 'blur_uni', 'blur_motion', 'blur_gauss', 'blur_aniso', 'color',
-                          'sr4', 'sr8', 'inp_box', 'denoising']
-    if problem_config["deg"] not in accepted_operators:
-        raise RuntimeError('Unknown degradation.')
-
-    if problem_config["deg"] == 'inp_box':
-        mask = torch.ones(1, 1, data_config["image_size"], data_config["image_size"])
-        mask[:, :, 64:192, 64:192] = 0
-        mask = mask.to(device)
-        missing_r = torch.nonzero(mask[0, 0].reshape(-1) == 0).long().reshape(-1) * 3
-        missing_g = missing_r + 1
-        missing_b = missing_g + 1
-        missing = torch.cat([missing_r, missing_g, missing_b], dim=0)
-        H = Inpainting(3, 256, missing, mask, device)
-    elif problem_config["deg"][:10] == 'sr_bicubic':
-        factor = int(problem_config["deg"][10:])
-
-        def bicubic_kernel(x, a=-0.5):
-            if abs(x) <= 1:
-                return (a + 2) * abs(x) ** 3 - (a + 3) * abs(x) ** 2 + 1
-            elif 1 < abs(x) and abs(x) < 2:
-                return a * abs(x) ** 3 - 5 * a * abs(x) ** 2 + 8 * a * abs(x) - 4 * a
-            else:
-                return 0
-
-        k = np.zeros((factor * 4))
-        for q in range(factor * 4):
-            x = (1 / factor) * (q - np.floor(factor * 4 / 2) + 0.5)
-            k[q] = bicubic_kernel(x)
-        k = k / np.sum(k)
-        kernel = torch.from_numpy(k).float().to(device)
-        H = SRConv(kernel / kernel.sum(), 3, 256, device, stride=factor)
-    elif problem_config["deg"] == 'blur_uni':
-        H = Deblurring(torch.Tensor([1 / 9] * 9).to(device), 3, 256, device)
-    elif problem_config["deg"] == 'blur_gauss':
-        sigma = np.sqrt(3) # DDRM blur operator weird; to match dps w/ sigma=3 need sigma=sqrt(3)
-        pdf = lambda x: torch.exp(-0.5 * (x / sigma) ** 2)
-        kernel = pdf(torch.arange(61) - 30).to(device)
-        kernel = kernel / kernel.sum()
-        H = Deblurring(kernel, 3, 256, device)
-    elif problem_config["deg"] == 'blur_motion':
-        H = MotionBlurOperator(61, 0.5, 3, 256, device)
-    elif problem_config["deg"] == 'blur_aniso':
-        sigma = 20
-        pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x / sigma) ** 2]))
-        kernel2 = torch.Tensor([pdf(-4), pdf(-3), pdf(-2), pdf(-1), pdf(0), pdf(1), pdf(2), pdf(3), pdf(4)]).to(
-            device)
-        sigma = 1
-        pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x / sigma) ** 2]))
-        kernel1 = torch.Tensor([pdf(-4), pdf(-3), pdf(-2), pdf(-1), pdf(0), pdf(1), pdf(2), pdf(3), pdf(4)]).to(
-            device)
-        H = Deblurring2D(kernel1 / kernel1.sum(), kernel2 / kernel2.sum(), 3,
-                         256, device)
-    elif problem_config["deg"] == 'color':
-        coloring = True
-        H = Colorization(256, device)
-    elif problem_config["deg"][:2] == 'sr':
-        sr = True
-        blur_by = int(problem_config["deg"][2:])
-        H = SuperResolution(3, 256, blur_by, device)
-    else:
-        H = Denoising(3, 256, device)
-
-    # compute s_max
-    with torch.no_grad():
-        b_k = torch.randn(1, 3, 256, 256).to(device)
-        for _ in range(50):
-            # calculate the matrix-by-vector product Ab
-            b_k1 = H.Ht(H.H(b_k))
-
-            # calculate the norm
-            b_k1_norm = torch.linalg.norm(b_k1)
-
-            # re normalize the vector
-            b_k = b_k1 / b_k1_norm
-
-        s_max = torch.sqrt(torch.linalg.norm(H.Ht(H.H(b_k))))
-
-        H.s_max = s_max.cpu().numpy()
-
-    return H
-
-
 class H_functions:
     """
     A class replacing the SVD of a matrix H, perhaps efficiently.
@@ -172,6 +87,9 @@ class H_functions:
         temp[:, :singulars.shape[0]] = temp[:, :singulars.shape[0]] * singulars_inv
         return self.V(self.add_zeros(temp))
 
+    def error(self, x, y):
+        return ((self.H(x) - y) ** 2).flatten(1).sum(-1)
+
 
 # a memory inefficient implementation for any general degradation H
 class GeneralH(H_functions):
@@ -217,7 +135,7 @@ class Inpainting(H_functions):
     def __init__(self, channels, img_dim, missing_indices, inpaint_mask, device):
         self.channels = channels
         self.img_dim = img_dim
-        self.s_max = 1.0
+        self.s_star = 1.0
         self._singulars = torch.ones(channels * img_dim ** 2 - missing_indices.shape[0]).to(device)
         self.missing_indices = missing_indices
         self.kept_indices = torch.Tensor([i for i in range(channels * img_dim ** 2) if i not in missing_indices]).to(
@@ -260,7 +178,7 @@ class Inpainting(H_functions):
 # Denoising
 class Denoising(H_functions):
     def __init__(self, channels, img_dim, device):
-        self.s_max = 1.0
+        self.mask = torch.ones(1, channels, img_dim, img_dim)
         self._singulars = torch.ones(channels * img_dim ** 2, device=device)
 
     def V(self, vec):
@@ -293,7 +211,7 @@ class SuperResolution(H_functions):
         H = torch.Tensor([[1 / ratio ** 2] * ratio ** 2]).to(device)
         self.U_small, self.singulars_small, self.V_small = torch.svd(H, some=False)
         self.Vt_small = self.V_small.transpose(0, 1)
-        self.s_max = 1.0
+        self.mask = torch.ones(1, channels, img_dim, img_dim)
 
     def V(self, vec):
         # reorder the vector back into patches (because singulars are ordered descendingly)
@@ -357,7 +275,11 @@ class Colorization(H_functions):
         H = torch.Tensor([[0.3333, 0.3334, 0.3333]]).to(device)
         self.U_small, self.singulars_small, self.V_small = torch.svd(H, some=False)
         self.Vt_small = self.V_small.transpose(0, 1)
-        self.s_max = 1.0
+        self.mask = torch.zeros(self.channels, self.channels, img_dim, img_dim)
+        self.mask[0, 0, :, :] = 1.
+        self.mask[1, 1, :, :] = 1.
+        self.mask[2, 2, :, :] = 1.
+        self.mask = torch.ones(1, self.channels, img_dim, img_dim)
 
     def V(self, vec):
         # get the needles
@@ -415,7 +337,7 @@ class WalshHadamardCS(H_functions):
         self.ratio = ratio
         self.perm = perm
         self._singulars = torch.ones(channels * img_dim ** 2 // ratio, device=device)
-        self.s_max = 1.0
+        self.mask = torch.ones(1, channels, img_dim, img_dim)
 
     def V(self, vec):
         temp = torch.zeros(vec.shape[0], self.channels, self.img_dim ** 2, device=vec.device)
@@ -453,7 +375,7 @@ class SRConv(H_functions):
     def __init__(self, kernel, channels, img_dim, device, stride=1):
         self.img_dim = img_dim
         self.channels = channels
-        self.s_max = 1.0
+        self.s_star = 0.25
         self.ratio = stride
         self.mask = torch.ones(1, channels, img_dim, img_dim)
         small_dim = img_dim // stride
@@ -530,6 +452,205 @@ class SRConv(H_functions):
         return temp
 
 
+class SRBicubic(H_functions):
+    def __init__(self, kk, up, channels, img_dim, device, kernel_type='gauss'):
+        d = img_dim ** 2  # number of pixels
+
+        # vectorization functions
+        d_sqrt = int(np.sqrt(d))
+
+        self.img_dim = img_dim
+        self.up = up
+        self.channels = channels
+        self.kernel_size = kk
+        self.pad_size = 64
+
+        W = self.get_bicubic_kernel_2d(kk, up)
+        dzp = d_sqrt + self.pad_size  # padded image is dzp-by-dzp
+        kh = int((kk - 1) / 2)
+        off = int(dzp / 2) - kh
+        Wzp = np.zeros((dzp, dzp))  # zero-pad to size dzp-by-dzp
+        Wzp[off:off + kk, off:off + kk] = W  # peak at center
+        Wzp = np.fft.ifftshift(Wzp)  # peak at (0,0)
+        # plt.imshow(Wzp)
+        self.fftWzp = torch.tensor(np.real(np.fft.fft2(Wzp))).to(device).unsqueeze(0).repeat(self.channels, 1, 1)  # complex with zero-valued imaginary part
+        # print('fftWzp =',fftWzp)
+
+    def im2vec(self, im):
+        return im.reshape(im.shape[0], -1).clone()
+
+    def vec2im(self, vec):
+        dd = vec.shape[1] // self.channels
+        d_sqrt = int(np.sqrt(dd))
+        return vec.reshape(vec.shape[0], self.channels, d_sqrt, d_sqrt)
+
+    def pad(self, im, p):
+        return F.pad(im, (p, p, p, p), mode='constant', value=0.)
+
+    def padT(self, im, p):
+        new_im = im.clone()
+
+        if p != 0:
+            new_im = new_im[:, :, p:-p, p:-p]
+
+        return new_im
+
+    def unpad(self, im, p):
+        return self.padT(im, p)
+
+    def unpadT(self, im, p):
+        return self.pad(im, p)
+
+    def get_bicubic_kernel_2d(self, kk, up, a=None):
+        kh = int((kk - 1) / 2)
+        x = np.arange(-kh / up, (kh + 1) / up, 1 / up)
+        w1 = self.get_bicubic_kernel_1d(x, a)  # 1D kernel
+        W = w1[:, None] * w1[None, :]  # 2D kernel
+
+        return W / W.sum()
+
+    def get_bicubic_kernel_1d(self, x, a=None):
+        if a is None:
+            a = -0.5  # default value
+        W = np.zeros((x.shape[0], 2))
+        W[:, 0] = (a + 2) * np.abs(x) ** 3 - (a + 3) * np.abs(x) ** 2 + 1
+        W[:, 1] = a * np.abs(x) ** 3 - 5 * a * np.abs(x) ** 2 + 8 * a * np.abs(x) - 4 * a
+        X = np.zeros((x.shape[0], 2))
+        X[:, 0] = (np.abs(x) <= 1)
+        X[:, 1] = (np.abs(x) < 2) * (np.abs(x) > 1)
+        w = np.sum(W * X, axis=1)
+
+        return w
+
+    def downsample(self, im, factor):
+        return im[:, :, 0:-1:factor, 0:-1:factor]
+
+    def upsample(self, im, factor):
+        d1 = im.shape[2]
+        d2 = im.shape[3]
+        Xhi = torch.zeros((im.shape[0], im.shape[1], d1 * factor, d2 * factor)).to(im.device)
+        Xhi[:, :, 0:-1:factor, 0:-1:factor] = im
+        return Xhi
+
+    def H(self, vec):
+        pd = lambda X: self.pad(X, self.pad_size // 2)
+        upd = lambda X: self.unpad(X, self.pad_size // 2)
+        imupT = lambda X: self.downsample(X, self.up)
+
+        return self.im2vec(imupT(upd(torch.real(torch.fft.ifft2(self.fftWzp[None, :, :, :] * torch.fft.fft2(pd(vec)))))))
+
+    def Ht(self, vec):
+        pdT = lambda X: self.padT(X, self.pad_size // 2)
+        updT = lambda X: self.unpadT(X, self.pad_size // 2)
+        imup = lambda X: self.upsample(X, self.up)
+
+        return self.im2vec(pdT(torch.real(torch.fft.ifft2(self.fftWzp[None, :, :, :] * torch.fft.fft2(updT(imup(self.vec2im(vec))))))))
+
+
+class SRDebug(H_functions):
+    def __init__(self, kk, up, channels, img_dim, device, kernel_type='gauss'):
+        d = img_dim ** 2  # number of pixels
+
+        # vectorization functions
+        d_sqrt = int(np.sqrt(d))
+
+        self.img_dim = img_dim
+        self.channels = channels
+        self.s_star = 1.0
+        self.kernel_size = kk
+        self.pad_size = 64
+        self.d_sqrt = d_sqrt
+        self.up = up
+
+        kernel = self.get_bicubic_kernel_2d(kk, up)
+
+        k = int((kk - 1) / 2)
+        off = int(np.sqrt(d) / 2) - k
+        G = np.zeros((d_sqrt, d_sqrt))
+        G[off:off + kk, off:off + kk] = kernel  # peak at center
+        G = np.fft.ifftshift(G)  # peak at (0,0)
+        # plt.imshow(G)
+        fftG = np.real(np.fft.fft2(G))
+
+        self.fftG = torch.tensor(fftG).to(device).unsqueeze(0).repeat(self.channels, 1, 1)  # complex with zero-valued imaginary part
+
+        self.sing = self.fftG
+
+    def im2vec(self, im):
+        return im.reshape(im.shape[0], -1).clone()
+
+    def vec2im(self, vec):
+        if len(vec.shape) == 4:
+            return vec.reshape(vec.shape[0], self.channels, vec.shape[-1], vec.shape[-1])
+        else:
+            dd = vec.shape[1] // self.channels
+            d_sqrt = int(np.sqrt(dd))
+            return vec.reshape(vec.shape[0], self.channels, d_sqrt, d_sqrt)
+
+    def get_bicubic_kernel_2d(self, kk, up, a=None):
+        kh = int((kk - 1) / 2)
+        x = np.arange(-kh / up, (kh + 1) / up, 1 / up)
+        w1 = self.get_bicubic_kernel_1d(x, a)  # 1D kernel
+        W = w1[:, None] * w1[None, :]  # 2D kernel
+
+        return W.sum()
+
+    def get_bicubic_kernel_1d(self, x, a=None):
+        if a is None:
+            a = -0.5  # default value
+        W = np.zeros((x.shape[0], 2))
+        W[:, 0] = (a + 2) * np.abs(x) ** 3 - (a + 3) * np.abs(x) ** 2 + 1
+        W[:, 1] = a * np.abs(x) ** 3 - 5 * a * np.abs(x) ** 2 + 8 * a * np.abs(x) - 4 * a
+        X = np.zeros((x.shape[0], 2))
+        X[:, 0] = (np.abs(x) <= 1)
+        X[:, 1] = (np.abs(x) < 2) * (np.abs(x) > 1)
+        w = np.sum(W * X, axis=1)
+
+        return w
+
+    def downsample(self, im, factor):
+        return im[:, :, 0:-1:factor, 0:-1:factor]
+
+    def upsample(self, im, factor):
+        d1 = im.shape[2]
+        d2 = im.shape[3]
+        Xhi = torch.zeros((im.shape[0], im.shape[1], d1 * factor, d2 * factor)).to(im.device)
+        Xhi[:, :, 0:-1:factor, 0:-1:factor] = im
+        return Xhi
+
+    def H(self, vec):
+        imupT = lambda X: self.downsample(X, self.up)
+
+        return self.im2vec(imupT(torch.real(torch.fft.ifft2(self.fftG[None, :, :, :] * torch.fft.fft2(self.vec2im(vec))))))
+
+    def Ht(self, vec):
+        imup = lambda X: self.upsample(X, self.up)
+
+        return self.im2vec(torch.real(torch.fft.ifft2(self.fftG[None, :, :, :] * torch.fft.fft2(imup(self.vec2im(vec))))))
+
+    def V(self, vec):
+        return torch.real(torch.fft.ifft2(self.vec2im(vec)) * self.d_sqrt)
+
+    def Vt(self, vec):
+        return torch.fft.fft2(self.vec2im(vec)) / self.d_sqrt
+
+    def U(self, vec):
+        imupT = lambda X: self.downsample(X, self.up)
+
+        return imupT(torch.real(torch.fft.ifft2(self.vec2im(vec))))
+
+    def Ut(self, vec):
+        imup = lambda X: self.upsample(X, self.up)
+
+        return torch.fft.fft2(imup(self.vec2im(vec)))
+
+    def singulars(self):
+        return self.sing
+
+    def add_zeros(self, vec):
+        return vec.clone()
+
+
 # Deblurring
 class Deblurring(H_functions):
     def mat_by_img(self, M, v):
@@ -544,6 +665,7 @@ class Deblurring(H_functions):
         kernel = kernel.double()
         self.img_dim = img_dim
         self.channels = channels
+        self.mask = torch.ones(1, channels, img_dim, img_dim)
         # build 1D conv matrix
         H_small = torch.zeros(img_dim, img_dim, device=device).double()
         for i in range(img_dim):
@@ -559,7 +681,6 @@ class Deblurring(H_functions):
                                        self.singulars_small.reshape(1, img_dim)).reshape(img_dim ** 2)
         # sort the big matrix singulars and save the permutation
         self._singulars, self._perm = self._singulars.sort(descending=True)  # , stable=True)
-        self.s_max = 1.0
 
     def V(self, vec):
         # invert the permutation
@@ -604,6 +725,185 @@ class Deblurring(H_functions):
         return vec.clone().reshape(vec.shape[0], -1)
 
 
+class DeblurringGeneral(H_functions):
+    def __init__(self, kk, sigma, channels, img_dim, device, kernel_type='gauss'):
+        d = img_dim ** 2  # number of pixels
+
+        # vectorization functions
+        d_sqrt = int(np.sqrt(d))
+
+        self.img_dim = img_dim
+        self.channels = channels
+        self.s_star = 1.0
+        self.kernel_size = kk
+        self.pad_size = 64
+
+        if kernel_type == 'gauss':
+            kernel = self.get_gauss_kernel(kk, sigma)
+        else:
+            raise NotImplementedError
+
+        dzp = d_sqrt + self.pad_size  # padded image is dzp-by-dzp
+        kh = int((kk - 1) / 2)
+        off = int(dzp / 2) - kh
+        Gzp = np.zeros((dzp, dzp))  # zero-pad to size dzp-by-dzp
+        Gzp[off:off + kk, off:off + kk] = kernel  # peak at center
+        Gzp = np.fft.ifftshift(Gzp)  # peak at (0,0)
+        self.fftGzp = torch.tensor(np.real(np.fft.fft2(Gzp))).to(device).unsqueeze(0).repeat(self.channels, 1, 1)  # complex with zero-valued imaginary part
+
+        self.sing = self.fftGzp.reshape(-1)
+
+    def im2vec(self, im):
+        return im.reshape(im.shape[0], -1).clone()
+
+    def vec2im(self, vec):
+        return vec.reshape(vec.shape[0], self.channels, self.img_dim, self.img_dim)
+
+    def pad(self, im, p):
+        return F.pad(im, (p, p, p, p), mode='constant', value=0.)
+
+    def padT(self, im, p):
+        new_im = im.clone()
+
+        if p != 0:
+            new_im = new_im[:, :, p:-p, p:-p]
+
+        return new_im
+
+    def unpad(self, im, p):
+        return self.padT(im, p)
+
+    def unpadT(self, im, p):
+        return self.pad(im, p)
+
+    def get_gauss_kernel(self, kk, sig):
+        gauss2 = multivariate_normal(mean=[0, 0], cov=[[sig ** 2, 0], [0, sig ** 2]])
+        k = int((kk - 1) / 2)
+        p1, p2 = np.mgrid[-k:k + 1:1, -k:k + 1:1]
+        pp = np.dstack((p1, p2))  # kk-by-kk pixel grid
+        G = gauss2.pdf(pp)  # peaks at center or (k,k)
+        # G = np.fft.ifftshift(G) # peaks at (0,0)
+        # plt.imshow(G)
+        return G / np.sum(G)
+
+    def H(self, vec):
+        pd = lambda X: self.pad(X, self.pad_size // 2)
+        upd = lambda X: self.unpad(X, self.pad_size // 2)
+
+        return self.im2vec(upd(torch.real(torch.fft.ifft2(self.fftGzp[None, :, :, :] * torch.fft.fft2(pd(self.vec2im(vec)))))))
+
+    def Ht(self, vec):
+        pdT = lambda X: self.padT(X, self.pad_size // 2)
+        updT = lambda X: self.unpadT(X, self.pad_size // 2)
+
+        return self.im2vec(pdT(torch.real(torch.fft.ifft2(self.fftGzp[None, :, :, :] * torch.fft.fft2(updT(self.vec2im(vec)))))))
+
+    def H_no_pad(self, vec):
+        return self.im2vec(torch.real(torch.fft.ifft2(self.fftG[None, :, :, :] * torch.fft.fft2(vec))))
+
+    def Ht_no_pad(self, vec):
+        return self.im2vec(torch.real(torch.fft.ifft2(self.fftG[None, :, :, :] * torch.fft.fft2(self.vec2im(vec)))))
+
+    def V(self, vec):
+        return self.im2vec(torch.fft.ifft2(self.vec2im(vec)))
+
+    def Vt(self, vec):
+        return self.im2vec(torch.fft.fft2(self.vec2im(vec)))
+
+    def U(self, vec):
+        return self.img_dim * self.im2vec(torch.fft.ifft2(self.vec2im(vec)))
+
+    def Ut(self, vec):
+        return (1 / self.img_dim) * self.im2vec(torch.fft.fft2(self.vec2im(vec)))
+
+    def singulars(self):
+        return self.sing
+
+    def add_zeros(self, vec):
+        return vec.clone()
+
+class DeblurringDebug(H_functions):
+    def __init__(self, kk, sigma, channels, img_dim, device, kernel_type='gauss'):
+        d = img_dim ** 2  # number of pixels
+
+        # vectorization functions
+        d_sqrt = int(np.sqrt(d))
+
+        self.img_dim = img_dim
+        self.channels = channels
+        self.s_star = 1.0
+        self.kernel_size = kk
+        self.pad_size = 64
+        self.d_sqrt = d_sqrt
+
+        if kernel_type == 'gauss':
+            kernel = self.get_gauss_kernel(kk, sigma)
+        else:
+            raise NotImplementedError
+
+        # dzp = d_sqrt + self.pad_size  # padded image is dzp-by-dzp
+        # kh = int((kk - 1) / 2)
+        # off = int(dzp / 2) - kh
+        # Gzp = np.zeros((dzp, dzp))  # zero-pad to size dzp-by-dzp
+        # Gzp[off:off + kk, off:off + kk] = kernel  # peak at center
+        # Gzp = np.fft.ifftshift(Gzp)  # peak at (0,0)
+        # fftGzp = np.real(np.fft.fft2(Gzp))
+
+        kk = 61  # kernel is kk-by-kk pixels
+        sig = 3  # gaussian blur std in pixels
+        k = int((kk - 1) / 2)
+        off = int(np.sqrt(d) / 2) - k
+        G = np.zeros((d_sqrt, d_sqrt))
+        G[off:off + kk, off:off + kk] = kernel  # peak at center
+        G = np.fft.ifftshift(G)  # peak at (0,0)
+        # plt.imshow(G)
+        fftG = np.real(np.fft.fft2(G))
+
+        self.fftG = torch.tensor(fftG).to(device).unsqueeze(0).repeat(self.channels, 1, 1)  # complex with zero-valued imaginary part
+
+        self.sing = self.fftG
+
+    def im2vec(self, im):
+        return im.reshape(im.shape[0], -1).clone()
+
+    def vec2im(self, vec):
+        return vec.reshape(vec.shape[0], self.channels, self.img_dim, self.img_dim)
+
+    def get_gauss_kernel(self, kk, sig):
+        gauss2 = multivariate_normal(mean=[0, 0], cov=[[sig ** 2, 0], [0, sig ** 2]])
+        k = int((kk - 1) / 2)
+        p1, p2 = np.mgrid[-k:k + 1:1, -k:k + 1:1]
+        pp = np.dstack((p1, p2))  # kk-by-kk pixel grid
+        G = gauss2.pdf(pp)  # peaks at center or (k,k)
+        # G = np.fft.ifftshift(G) # peaks at (0,0)
+        # plt.imshow(G)
+        return G / np.sum(G)
+
+    def H(self, vec):
+        return self.im2vec(torch.real(torch.fft.ifft2(self.fftG[None, :, :, :] * torch.fft.fft2(self.vec2im(vec)))))
+
+    def Ht(self, vec):
+        return self.im2vec(torch.real(torch.fft.ifft2(self.fftG[None, :, :, :] * torch.fft.fft2(self.vec2im(vec)))))
+
+    def V(self, vec):
+        return torch.fft.ifft2(self.vec2im(vec)) * self.d_sqrt
+
+    def Vt(self, vec):
+        return torch.fft.fft2(self.vec2im(vec)) / self.d_sqrt
+
+    def U(self, vec):
+        return self.V(vec)
+
+    def Ut(self, vec):
+        return self.Vt(vec)
+
+    def singulars(self):
+        return self.sing
+
+    def add_zeros(self, vec):
+        return vec.clone()
+
+
 class MotionBlurOperator(H_functions):
     def __init__(self, kk, intensity, channels, img_dim, device, ready_kernel=None):
         d = img_dim ** 2  # number of pixels
@@ -613,7 +913,7 @@ class MotionBlurOperator(H_functions):
 
         self.img_dim = img_dim
         self.channels = channels
-        self.s_max = 1.0
+        self.s_star = 1.0
         self.kernel_size = kk
         self.pad_size = 64
         # self.pad_size = 0
@@ -698,6 +998,55 @@ class MotionBlurOperator(H_functions):
     def add_zeros(self, vec):
         return vec.clone()
 
+class MotionBlurOperatorDPS(H_functions):
+    def __init__(self, kernel_size, intensity, device):
+        self.device = device
+        self.kernel_size = kernel_size
+        self.conv = Blurkernel(blur_type='motion',
+                               kernel_size=kernel_size,
+                               std=intensity,
+                               device=device).to(device)  # should we keep this device term?
+
+        self.kernel = Kernel(size=(kernel_size, kernel_size), intensity=intensity)
+        self.kernel_matrix = torch.tensor(self.kernel.kernelMatrix, dtype=torch.float32)
+        self.conv.update_weights(self.kernel_matrix)
+
+    def im2vec(self, im):
+        return im.reshape(im.shape[0], -1).clone()
+
+    def vec2im(self, vec):
+        return vec.reshape(vec.shape[0], 3, 256, 256).clone()
+
+    def H(self, vec):
+        return self.im2vec(self.conv(self.vec2im(vec)))
+
+    def Ht(self, vec):
+        return self.im2vec(self.conv(self.vec2im(vec)))
+
+    def get_kernel(self):
+        kernel = self.kernel.kernelMatrix.type(torch.float32).to(self.device)
+        return kernel.view(1, 1, self.kernel_size, self.kernel_size)
+
+class DeblurDPS(H_functions):
+    def __init__(self, kernel_size, intensity, device):
+        self.device = device
+        self.kernel_size = kernel_size
+        self.conv = Blurkernel(blur_type='gaussian',
+                               kernel_size=kernel_size,
+                               std=intensity,
+                               device=device).to(device)
+        self.kernel = self.conv.get_kernel()
+        self.conv.update_weights(self.kernel.type(torch.float32))
+
+    def H(self, vec):
+        return self.conv(vec)
+
+    def Ht(self, vec):
+        return self.conv(vec)
+
+    def get_kernel(self):
+        return self.kernel.view(1, 1, self.kernel_size, self.kernel_size)
+
 
 # Anisotropic Deblurring
 class Deblurring2D(H_functions):
@@ -712,7 +1061,7 @@ class Deblurring2D(H_functions):
     def __init__(self, kernel1, kernel2, channels, img_dim, device):
         self.img_dim = img_dim
         self.channels = channels
-        self.s_max = 1.0
+        self.mask = torch.ones(1, channels, img_dim, img_dim)
 
         # build 1D conv matrix - kernel1
         H_small1 = torch.zeros(img_dim, img_dim, device=device)

@@ -52,20 +52,21 @@ The entry point is `main.py`. The arguments are as follows:
 - `--diffusion_config`: The config file for the diffusion process used by the pretrained model
 - `--data_config`: The config for the dataset being used
 - `--problem_config`: The config for the inverse problem being solved
+- `--fire_config`: The config for DDfire for the current dataset
 - `--noiseless`: If this argument is present no noise is added to the measurements
 - `--sig_y`: The measurement noise standard deviation
 - `--nfes`: The number of NFEs to run
-- `--clamp-denoise`: Whether or not to clamp raw outputs from the pretrained model
-- `--clamp-fire-ddim`: Whether or not to clamp the FIRE output
+- `--gpus`: The number of GPUs to use
 
-An example invocation for Gaussian deblurring with noiseless FFHQ data is
+An example invocation for Gaussian deblurring with noisy FFHQ data is
 ```
 python main.py \
 --model_config=configs/ffhq_model_config.yaml \
 --diffusion_config=configs/ffhq_diffusion_config.yaml \
 --data_config=configs/ffhq_config.yaml \
 --problem_config=configs/problems/ffhq/blur_gauss_config.yaml \
---noiseless --nfes=100 --clamp-denoise --clamp-fire-ddim
+--fire_config=configs/fire_config_imagenet.yaml
+--sig_y=0.05 --nfes=1000 --gpus=1
 ```
 
 Similarly, an example for Gaussian deblurring with noisy ImageNet data is
@@ -75,10 +76,25 @@ python main.py \
 --diffusion_config=configs/imagenet_diffusion_config.yaml \
 --data_config=configs/imagenet_config.yaml \
 --problem_config=configs/problems/imagenet/blur_gauss_config.yaml \
---sig_y=0.05 --nfes=100 --clamp-denoise --clamp-fire-ddim
+--fire_config=configs/fire_config_imagenet.yaml
+--sig_y=0.05 --nfes=1000 --gpus=1
 ```
 
 Bash scripts that execute the above are available in the `scripts/` directory.
+
+## Evaluating Performance
+To evaluate performance for a given dataset/problem, run `evaluate_samples.py` as follows:
+```
+python evaluate_samples.py \
+--data_config=configs/{DATA_CONFIG}.yaml \
+--problem_config=configs/problems/{DATASET}/{PROBLEM_CONFIG}.yaml \
+--nfes=1000 --num_ims=1000
+```
+
+To evaluate FID, we use the pytorch_fid module, which can be run by
+```
+python -m pytorch_fid /path/to/gt/images /path/to/reconstructed/images
+```
 
 ## Extending the Code to New Inverse Problems
 ### Adding a New Forward Operator
@@ -102,7 +118,7 @@ Please model them after the existing config files.
 If you store your data in the same way that you did for FFHQ and ImageNet, and properly set the config files, it should be relatively painless
 to add a new dataset. It should also work out of the box with the `ImageDataModule` that the other datasets use, or it may require small modification.
 
-#### Computing the Learned FIRE Precision Scale Factor
+#### Computing the Learned FIRE Scale Factor
 The FIRE algorithm leverages a 'scale factor' computed from an additional validation set.
 We use this to compute an initial estimate for the pretrained denoiser output error variance.
 In `eta_scale/`, this scale factor is computed for FFHQ and ImageNet at all diffusion timesteps.

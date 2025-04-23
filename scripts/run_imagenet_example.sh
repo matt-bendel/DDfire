@@ -3,4 +3,12 @@ python main.py \
 --diffusion_config=configs/imagenet_diffusion_config.yaml \
 --data_config=configs/imagenet_config.yaml \
 --problem_config=configs/problems/imagenet/blur_gauss_config.yaml \
---sig_y=0.05 --nfes=100 --clamp-denoise --clamp-fire-ddim
+--fire_config=configs/fire_config_imagenet.yaml
+--sig_y=0.05 --nfes=1000 --gpus=1
+
+python -m pytorch_fid /GT/PATH /SAMPLE/PATH # TODO: Enter appropriate path..
+
+python evaluate_samples.py \
+--data_config=configs/imagenet_config.yaml \
+--problem_config=configs/problems/imagenet/blur_gauss_config.yaml \
+--nfes=1000 --num_ims=1000

@@ -1,76 +1,103 @@
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
 
-def clear_color(x):
-    if torch.is_complex(x):
-        x = torch.abs(x)
-    x = x.detach().cpu().squeeze().numpy()
-    return normalize_np(np.transpose(x, (1, 2, 0)))
-
-
-def normalize_np(img):
-    """ Normalize img in arbitrary range to [0, 1] """
-    img -= np.min(img)
-    img /= np.max(img)
-    return img
+from numpy.polynomial import Polynomial
 
 
 class FIRE:
-    def __init__(self, model, alphas_cumprod, x_T, H, sqrt_in_var_to_out, clamp_denoise):
+    def __init__(self, ref_tensor, gamma_model, model, A, rho, v_min, fire_config):
+        self.A = A
+        self.v_min = v_min
+        self.rho = rho
+        self.singular_match = A.s_star
+        self.gamma_model = gamma_model
+        self.var_model = 1 / gamma_model
         self.model = model
-        self.alphas_cumprod = alphas_cumprod
-        self.power = 0.5
-        self.H = H
-        self.v_min = ((1 - self.alphas_cumprod) / self.alphas_cumprod)[0]
 
-        self.singular_match = H.s_max
+        # Ablation params
+        self.use_svd = fire_config['use_svd']
+        self.use_stochastic_denoising = fire_config['use_stochastic_denoising']
+        self.use_colored_noise = fire_config['use_colored_noise']
+        self.estimate_nu = fire_config['estimate_nu']
 
-        self.tolerance = 1e-5
-        self.gam_w_correct = 1e4
-        self.max_cg_iters = 100
-        self.cg_initialization = torch.zeros_like(x_T)
+        # CG params
+        self.gam_w_correct = float(fire_config['gam_w_correct'])
+        self.max_cg_iters = int(fire_config['max_cg_iters'])
+        self.cg_tolerance = float(fire_config['cg_tolerance'])
 
-        self.rho = 1.25
-        self.max_iters = 50
+        self.cg_initialization = torch.zeros_like(ref_tensor)
 
-        self.clamp_denoise = clamp_denoise
+        with open(fire_config['nu_lookup'], 'rb') as f:
+            self.scale_factor = np.load(f)
 
-        with open(sqrt_in_var_to_out, 'rb') as f:
-            self.sqrt_in_variance_to_out = torch.from_numpy(np.load(f)).to(x_T.device)
+        # Quantized nu
+        nu = np.sqrt(self.var_model) * self.scale_factor
 
-    def uncond_denoiser_function(self, noisy_im, noise_var):
-        diff = torch.abs(
-            noise_var[:, 0, None] - (1 - torch.tensor(self.alphas_cumprod).to(noisy_im.device)) / torch.tensor(
-                self.alphas_cumprod).to(noisy_im.device))
-        t = torch.argmin(diff, dim=1)
+        # find first t where sequence decreases
+        first = np.argmin(np.diff(nu) >= 0)
 
-        ones = torch.ones(noise_var.shape, device=noise_var.device)
+        # start polynomial fit a bit earlier
+        earlier = 100
+        t_nofit = np.arange(first - earlier)
+        t_fit = np.arange(first - earlier, 1000)
 
-        delta = torch.minimum(noise_var / self.v_min, ones)
-        noise_var_clip = torch.maximum(noise_var, ones * self.v_min)
+        # try polynomial fit in log domain
+        logPoly_ffhq = Polynomial.fit(t_fit, np.log(nu[t_fit]), deg=10)
+        self.nu_predict = lambda t: np.exp(logPoly_ffhq(t))
 
-        scaled_noisy_im = noisy_im * torch.sqrt(1 / (1 + noise_var_clip[:, 0, None, None, None]))
+    def uncond_denoiser_function(self, noisy_im, noise_var, quantized_t):
+        delta = np.minimum(noise_var / self.v_min, 1.)
+        noise_var_clip = np.maximum(noise_var, self.v_min)
+
+        if quantized_t:
+            alpha_bars_model = 1 / (1 + 1 / self.gamma_model)
+            diff = torch.abs(
+                noise_var - (1 - torch.tensor(alpha_bars_model).to(noisy_im.device)) / torch.tensor(
+                    alpha_bars_model).to(noisy_im.device))
+            t = torch.argmin(diff).repeat(noisy_im.shape[0])
+        else:
+            t = torch.tensor(self.get_t_from_var(noise_var)).unsqueeze(0).repeat(noisy_im.shape[0]).to(noisy_im.device) # Need timestep for denoiser input
+
+        alpha_bar = 1 / (1 + noise_var_clip)
+        scaled_noisy_im = noisy_im * np.sqrt(alpha_bar)
 
         noise_predict = self.model(scaled_noisy_im, t)
 
         if noise_predict.shape[1] == 2 * noisy_im.shape[1]:
             noise_predict, _ = torch.split(noise_predict, noisy_im.shape[1], dim=1)
 
-        noise_est = torch.sqrt(noise_var_clip)[:, 0, None, None, None] * noise_predict
-        x_0 = (1 - delta ** self.power)[:, 0, None, None, None] * noisy_im + (delta ** self.power)[:, 0, None, None,
-                                                                             None] * (noisy_im - noise_est)
+        noise_est = np.sqrt(noise_var_clip) * noise_predict
 
-        return x_0, ((1 - torch.tensor(self.alphas_cumprod).to(noisy_im.device)) / torch.tensor(
-            self.alphas_cumprod).to(noisy_im.device))[t], t
+        x_0 = (1 - delta ** 0.5) * noisy_im + (delta ** 0.5) * (noisy_im - noise_est)
 
-    def CG(self, A, scaled_mu_2, y, gamma_w, eta):
+        return x_0, noise_var_clip, t
+
+    def denoising(self, r, gamma, quantized_t):
+        # Max var
+        noise_var = 1 / gamma
+
+        # Denoise
+        x_bar, noise_var, t = self.uncond_denoiser_function(r.float(), noise_var, quantized_t)
+        x_bar = x_bar.clamp(min=-1, max=1)
+
+        if quantized_t:
+            lookup_t = np.argmin(np.abs(self.gamma_model - gamma))
+            one_over_nu = 1 / (self.scale_factor[lookup_t] * np.sqrt(noise_var))
+        else:
+            one_over_nu = 1 / self.nu_predict(t[0].cpu().numpy())
+
+        return x_bar, torch.tensor(one_over_nu).unsqueeze(0).unsqueeze(0).repeat(x_bar.shape[0], 1).to(x_bar.device).float()
+
+    def CG(self, A, scaled_x_bar, y, gamma_y):
         # solve Abar'Abar x = Abar' y
 
         x = self.cg_initialization.clone()
+        x_store = torch.zeros_like(x)
 
-        b = gamma_w[:, 0, None, None, None] * self.H.Ht(y).view(scaled_mu_2.shape[0], scaled_mu_2.shape[1], scaled_mu_2.shape[2], scaled_mu_2.shape[3])
-        b = b + scaled_mu_2
+        saved_x = [False for i in range(x_store.shape[0])]
+
+        b = gamma_y[:, 0, None, None, None] * self.A.Ht(y).view(*scaled_x_bar.shape)
+        b = b + scaled_x_bar
 
         b_norm = torch.sum(b ** 2, dim=(1, 2, 3))
 
@@ -89,108 +116,111 @@ class FIRE:
 
             diff = (torch.sum(r ** 2, dim=(1, 2, 3)) / b_norm).sqrt()
 
-            if torch.mean(diff) <= self.tolerance:
+            all_saved = True
+            for i in range(diff.shape[0]):
+                if diff[i] <= self.cg_tolerance and not saved_x[i]:
+                    x_store[i] = x[i]
+                    saved_x[i] = True
+
+                if not saved_x[i]:
+                    all_saved = False
+
+            if all_saved:
                 break
 
             beta = torch.sum(r ** 2, dim=(1, 2, 3)) / rsold
 
             p = r + beta[:, None, None, None] * p
             num_cg_steps += 1
-            # if torch.isnan(x).any():
-            #     print(num_cg_steps)
-            #     exit()
 
-        # print(num_cg_steps)
-        # print(diff)
-        return x.clone()
+        for i in range(x.shape[0]):
+            if not saved_x[i]:
+                x_store[i] = x[i]
 
-    def linear_estimation(self, scaled_mu_2, y, gamma_w, eta):
-        # eta_np = eta
-        gamma_w_hat = gamma_w * torch.ones(scaled_mu_2.shape[0], 1).to(scaled_mu_2.device)
-        gamma_w_hat[gamma_w / eta > self.gam_w_correct] = self.gam_w_correct * eta[gamma_w / eta > self.gam_w_correct]
+        return x_store.clone()
 
-        CG_A = lambda vec: gamma_w_hat[:, 0, None, None, None] * self.H.Ht(self.H.H(vec)).view(scaled_mu_2.shape[0], scaled_mu_2.shape[1], scaled_mu_2.shape[2],
-                                                                           scaled_mu_2.shape[3]) + eta[:, 0, None, None, None] * vec
+    def linear_estimation(self, scaled_x_bar, y, gamma_y, one_over_nu):
+        gamma_y_hat = gamma_y * torch.ones(scaled_x_bar.shape[0], 1).to(scaled_x_bar.device)
+        gamma_y_hat[gamma_y / one_over_nu > self.gam_w_correct] = self.gam_w_correct * one_over_nu[
+            gamma_y / one_over_nu > self.gam_w_correct]
 
-        mu_1 = self.CG(CG_A, scaled_mu_2, y, gamma_w_hat, eta)
+        CG_A = lambda vec: gamma_y_hat[:, 0, None, None, None] * self.A.Ht(self.A.H(vec)).view(*scaled_x_bar.shape) + one_over_nu[:, 0, None, None, None] * vec
 
-        return mu_1
+        x_hat = self.CG(CG_A, scaled_x_bar, y, gamma_y_hat)
 
-    def denoising(self, mu_1, gamma_2):
-        # Max var
-        noise_var, _ = torch.max(1 / gamma_2, dim=1, keepdim=True)
+        return x_hat
 
-        # Denoise
-        mu_2, true_noise_var, used_t = self.uncond_denoiser_function(mu_1.float(), noise_var)
-        if self.clamp_denoise:
-            mu_2 = mu_2.clamp(min=-1, max=1)
+    def renoising(self, x_hat, one_over_nu, gamma, gamma_y):
+        gamma = self.rho * gamma
+        max_gamma = 1 / self.v_min
+        gamma = gamma if gamma < max_gamma else max_gamma
 
-        eta_2 = 1 / (self.sqrt_in_variance_to_out[used_t[0]] * true_noise_var[0].unsqueeze(0).sqrt().repeat(mu_2.shape[0], 1)).float()
+        gamma_y_hat = gamma_y * torch.ones(x_hat.shape[0], 1).to(x_hat.device)
+        gamma_y_hat[gamma_y / one_over_nu > self.gam_w_correct] = self.gam_w_correct * one_over_nu[
+            gamma_y / one_over_nu > self.gam_w_correct]
 
-        return mu_2, eta_2
+        eps_1 = torch.randn_like(x_hat)
+        transformed_eps_2 = self.A.Ht(torch.randn_like(self.A.H(x_hat))).view(*x_hat.shape)
 
-    def renoising(self, mu_1, eta, gamma_r, gamma_w):
-        gamma_r = self.rho * gamma_r
-        # eta_np = eta
-        gamma_w_hat = gamma_w * torch.ones(mu_1.shape[0], 1).to(mu_1.device)
-        gamma_w_hat[gamma_w / eta > self.gam_w_correct] = self.gam_w_correct * eta[gamma_w / eta > self.gam_w_correct]
-
-        max_prec = self.alphas_cumprod[0] / (1 - self.alphas_cumprod[0])
-        gamma_r = torch.minimum(gamma_r, torch.ones(gamma_r.shape).to(gamma_r.device) * max_prec)
-
-        eps_1 = torch.randn_like(mu_1)
-        transformed_eps_2 = self.H.Ht(torch.randn_like(self.H.H(mu_1))).view(mu_1.shape[0], mu_1.shape[1], mu_1.shape[2], mu_1.shape[3])
-
-        eps_1_scale_squared = torch.max(1 / gamma_r[0, 0] - 1 / (eta), torch.zeros_like(1 / gamma_r[0, 0] - 1 / (eta)))
-        eps_2_scale_squared = (1 / eta - ((gamma_w_hat ** 2) * self.singular_match ** 2 / gamma_w + eta) / ((gamma_w_hat * self.singular_match ** 2 + eta) ** 2)) / (self.singular_match ** 2)
+        eps_1_scale_squared = torch.max(1 / gamma - 1 / one_over_nu, torch.zeros_like(1 / gamma - 1 / one_over_nu))
+        eps_2_scale_squared = (1 / one_over_nu - ((gamma_y_hat ** 2) * self.singular_match ** 2 / gamma_y + one_over_nu) / (
+                    (gamma_y_hat * self.singular_match ** 2 + one_over_nu) ** 2)) / (self.singular_match ** 2)
         eps_2_scale_squared = torch.max(eps_2_scale_squared, torch.zeros_like(eps_2_scale_squared))
 
-        noise_approx = eps_1_scale_squared.sqrt()[:, 0, None, None, None] * eps_1
-        noise_approx = noise_approx + eps_2_scale_squared.sqrt()[:, 0, None, None, None] * transformed_eps_2
+        noise = eps_1_scale_squared.sqrt()[:, 0, None, None, None] * eps_1
+        noise = noise + eps_2_scale_squared.sqrt()[:, 0, None, None, None] * transformed_eps_2
 
-        mu_1_noised = mu_1.clone() + noise_approx
+        r = x_hat + noise
 
-        return mu_1_noised, gamma_r
+        return r, gamma
 
-    def run_fire(self, x_t, y, t_alpha_bar, noise_sig):
+    def get_t_from_var(self, noise_var):
+        return np.minimum(999 * (np.sqrt(0.1 ** 2 + 2 * 19.9 * np.log(1 + noise_var)) - 0.1) / 19.9, 999)
+
+    def reset(self):
+        self.cg_initialization = torch.zeros_like(self.cg_initialization)
+
+    def run_fire(self, x_t, y, sig_y, gamma_init, fire_iters, first_k=False, ve_init=False, quantized_t=False):
         # 0. Initialize Values
-        gamma_r = torch.tensor([t_alpha_bar / (1 - t_alpha_bar)]).unsqueeze(0).repeat(x_t.shape[0], 1).to(
-            x_t.device)
-        gamma_w = 1 / (noise_sig ** 2)
-        mu_1 = x_t / torch.sqrt(t_alpha_bar)
-        mu_1_noised = mu_1.clone()
+        gamma = gamma_init
+        gamma_y = 1 / (sig_y ** 2)
 
-        for i in range(self.max_iters):
+        alpha_bar = 1 / (1 + 1 / gamma)
+
+        if ve_init:
+            x_hat = x_t / np.sqrt(gamma_init) if first_k else x_t
+        else:
+            x_hat = x_t / np.sqrt(alpha_bar)
+
+        r = x_hat.clone()
+
+        for i in range(fire_iters):
             # 1. Denoising
-            mu_2, eta = self.denoising(mu_1_noised, gamma_r)
-            mu_2 = mu_2 + torch.randn_like(mu_2) / (eta[:, 0, None, None, None]).sqrt()
+            x_bar, one_over_nu = self.denoising(r, gamma, quantized_t)
+            # if self.use_stochastic_denoising:
+            #     x_bar = x_bar + torch.randn_like(x_bar) / np.sqrt(one_over_nu)
+            #     one_over_nu = torch.tensor(one_over_nu / 2).unsqueeze(0).repeat(x_bar.shape[0]).unsqueeze(1).to(x_bar.device)
 
-            tr_approx = 0.
-            num_samps = 50
-            m = 0
-            for k in range(num_samps):
-                out = self.H.H(torch.randn_like(mu_1))
-                m = out.shape[1]
-                tr_approx += torch.sum(out ** 2, dim=1).unsqueeze(1)
+            if self.estimate_nu:
+                tr_approx = 0.
+                num_samps = 50
+                m = 0
+                for k in range(num_samps):
+                    out = self.A.H(torch.randn_like(x_hat))
+                    m = out.shape[1]
+                    tr_approx += torch.sum(out ** 2, dim=1).unsqueeze(1)
 
-            tr_approx = tr_approx / num_samps
-            y_m_A_mu_2 = torch.sum((y - self.H.H(mu_2)) ** 2, dim=1).unsqueeze(1)
-            eta = tr_approx / (y_m_A_mu_2 - m / gamma_w)
-            eta = eta.float()
+                tr_approx = tr_approx / num_samps
+                y_m_A_x_bar = torch.sum((y - self.A.H(x_bar)) ** 2, dim=1).unsqueeze(1)
+                one_over_nu = tr_approx / (y_m_A_x_bar - m / gamma_y)
 
             # 2. Linear Estimation
-            mu_1 = self.linear_estimation(mu_2 * eta[:, 0, None, None, None], y, gamma_w, eta)
+            x_hat = self.linear_estimation(x_bar * one_over_nu[:, 0, None, None, None], y, gamma_y, one_over_nu)
 
             # 3. Re-Noising
-            mu_1_noised, gamma_r = self.renoising(mu_1, eta, gamma_r, gamma_w)
+            r, gamma = self.renoising(x_hat, one_over_nu, gamma, gamma_y)
 
-            self.cg_initialization = mu_1.clone() # CG warm start
+            self.cg_initialization = x_hat.clone()
 
-        return mu_1.float()
+        return x_hat.clamp(min=-1., max=1.).float()
 
-
-def extract_and_expand(array, time, target):
-    array = torch.from_numpy(array).to(target.device)[time].float()
-    while array.ndim < target.ndim:
-        array = array.unsqueeze(-1)
-    return array.expand_as(target)
