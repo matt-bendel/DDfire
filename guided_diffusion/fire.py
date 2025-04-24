@@ -15,7 +15,6 @@ class FIRE:
         self.model = model
 
         # Ablation params
-        self.use_svd = fire_config['use_svd']
         self.use_stochastic_denoising = fire_config['use_stochastic_denoising']
         self.use_colored_noise = fire_config['use_colored_noise']
         self.estimate_nu = fire_config['estimate_nu']

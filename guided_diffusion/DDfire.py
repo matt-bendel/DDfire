@@ -26,9 +26,6 @@ class DDfire:
         vp_ddim_prec_log = np.linspace(np.max(vp_prec_log), np.min(vp_prec_log), self.K)
         vp_ddim_prec = 10 ** vp_ddim_prec_log
 
-        # TODO: REMOVE!!
-        vp_ddim_prec = np.linspace(np.max(vp_prec), np.min(vp_prec), self.K)
-
         all_steps = []
         for i in range(K):
             t = np.argmin(np.abs(vp_prec - vp_ddim_prec[i]), axis=0)

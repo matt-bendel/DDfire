@@ -1,4 +1,3 @@
-use_svd: False
 use_stochastic_denoising: False
 use_colored_noise: True
 estimate_nu: True
