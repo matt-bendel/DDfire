@@ -1,27 +1,4 @@
 deg: "sr_bicubic4"
-
-noisy:
-  20:
-    K: 10
-    delta_1: 0.50
-
-  100:
-    K: 75
-    delta_1: 0.5
-
-  1000:
-    K: 500
-    delta_1: 0.25
-
-noiseless:
-  20:
-    K: 10
-    delta_1: 0.25
-
-  100:
-    K: 50
-    delta_1: 0.25
-
-  1000:
-    K: 500
-    delta_1: 0.25
+K: 500
+delta: 0.2
+eta: 1.5 # Will need to make it smaller for NFEs < 1000

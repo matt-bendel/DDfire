@@ -1,14 +1,4 @@
 deg: "blur_motion"
-
-noisy:
-  20:
-    K: 8
-    delta_1: 0.2
-
-  100:
-    K: 50
-    delta_1: 0.5
-
-  1000:
-    K: 500
-    delta_1: 0.1
+K: 500
+delta: 0.2
+eta: 1.5 # Will need to make it smaller for NFEs < 1000

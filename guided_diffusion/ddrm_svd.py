@@ -6,6 +6,89 @@ from scipy.stats import multivariate_normal
 from util.img_utils import Blurkernel, fft2_m
 from motionblur.motionblur import Kernel
 
+def get_operator(problem_config, data_config, device):
+    accepted_operators = ['sr_bicubic4', 'sr_bicubic8', 'blur_uni', 'blur_motion', 'blur_gauss', 'blur_aniso', 'color',
+                          'sr4', 'sr8', 'inp_box', 'denoising']
+    if problem_config["deg"] not in accepted_operators:
+        raise RuntimeError('Unknown degradation.')
+
+    if problem_config["deg"] == 'inp_box':
+        mask = torch.ones(1, 1, data_config["image_size"], data_config["image_size"])
+        mask[:, :, 64:192, 64:192] = 0
+        mask = mask.to(device)
+        missing_r = torch.nonzero(mask[0, 0].reshape(-1) == 0).long().reshape(-1) * 3
+        missing_g = missing_r + 1
+        missing_b = missing_g + 1
+        missing = torch.cat([missing_r, missing_g, missing_b], dim=0)
+        H = Inpainting(3, 256, missing, mask, device)
+    elif problem_config["deg"][:10] == 'sr_bicubic':
+        factor = int(problem_config["deg"][10:])
+
+        def bicubic_kernel(x, a=-0.5):
+            if abs(x) <= 1:
+                return (a + 2) * abs(x) ** 3 - (a + 3) * abs(x) ** 2 + 1
+            elif 1 < abs(x) and abs(x) < 2:
+                return a * abs(x) ** 3 - 5 * a * abs(x) ** 2 + 8 * a * abs(x) - 4 * a
+            else:
+                return 0
+
+        k = np.zeros((factor * 4))
+        for q in range(factor * 4):
+            x = (1 / factor) * (q - np.floor(factor * 4 / 2) + 0.5)
+            k[q] = bicubic_kernel(x)
+        k = k / np.sum(k)
+        kernel = torch.from_numpy(k).float().to(device)
+        H = SRConv(kernel / kernel.sum(), 3, 256, device, stride=factor)
+    elif problem_config["deg"] == 'blur_uni':
+        H = Deblurring(torch.Tensor([1 / 9] * 9).to(device), 3, 256, device)
+    elif problem_config["deg"] == 'blur_gauss':
+        sigma = np.sqrt(3) # DDRM blur operator weird; to match dps w/ sigma=3 need sigma=sqrt(3)
+        pdf = lambda x: torch.exp(-0.5 * (x / sigma) ** 2)
+        kernel = pdf(torch.arange(61) - 30).to(device)
+        kernel = kernel / kernel.sum()
+        H = Deblurring(kernel, 3, 256, device)
+    elif problem_config["deg"] == 'blur_motion':
+        H = MotionBlurOperator(61, 0.5, 3, 256, device)
+    elif problem_config["deg"] == 'blur_aniso':
+        sigma = 20
+        pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x / sigma) ** 2]))
+        kernel2 = torch.Tensor([pdf(-4), pdf(-3), pdf(-2), pdf(-1), pdf(0), pdf(1), pdf(2), pdf(3), pdf(4)]).to(
+            device)
+        sigma = 1
+        pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x / sigma) ** 2]))
+        kernel1 = torch.Tensor([pdf(-4), pdf(-3), pdf(-2), pdf(-1), pdf(0), pdf(1), pdf(2), pdf(3), pdf(4)]).to(
+            device)
+        H = Deblurring2D(kernel1 / kernel1.sum(), kernel2 / kernel2.sum(), 3,
+                         256, device)
+    elif problem_config["deg"] == 'color':
+        coloring = True
+        H = Colorization(256, device)
+    elif problem_config["deg"][:2] == 'sr':
+        sr = True
+        blur_by = int(problem_config["deg"][2:])
+        H = SuperResolution(3, 256, blur_by, device)
+    else:
+        H = Denoising(3, 256, device)
+
+    # compute s_max
+    with torch.no_grad():
+        b_k = torch.randn(1, 3, 256, 256).to(device)
+        for _ in range(50):
+            # calculate the matrix-by-vector product Ab
+            b_k1 = H.Ht(H.H(b_k))
+
+            # calculate the norm
+            b_k1_norm = torch.linalg.norm(b_k1)
+
+            # re normalize the vector
+            b_k = b_k1 / b_k1_norm
+
+        s_max = torch.sqrt(torch.linalg.norm(H.Ht(H.H(b_k))))
+
+        H.s_max = s_max.cpu().numpy()
+
+    return H
+
 class H_functions:
     """
     A class replacing the SVD of a matrix H, perhaps efficiently.
