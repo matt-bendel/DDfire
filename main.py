@@ -97,6 +97,8 @@ def main(args):
         beta_start, beta_end, 1000, dtype=np.float64
     )
 
+    A = get_operator(problem_config, data_config, device)
+
     # Load diffusion sampler
     sampler = DDfire(fire_config, torch.ones(data_config["batch_size"], 3, 256, 256).to(device), model, model_betas, A, problem_config['K'],
            problem_config['delta'], problem_config['eta'], N_tot=args.nfes, quantize_ddim=False)
@@ -105,8 +107,6 @@ def main(args):
 
     dm.setup()
     test_loader = dm.test_dataloader()
-
-    H = get_operator(problem_config, data_config, device)
 
     os.makedirs(data_config["fire_out"] + f'/{args.nfes}/{problem_config["deg"]}{"" if args.noiseless else "_noisy"}/' + 'samples', exist_ok=True)
     os.makedirs(data_config["fire_out"] + f'/{args.nfes}/{problem_config["deg"]}{"" if args.noiseless else "_noisy"}/' + 'x', exist_ok=True)
@@ -123,7 +123,7 @@ def main(args):
         x = data[0]
         x = x.to(device)
 
-        y_n = H.H(x)
+        y_n = A.H(x)
         if not args.noiseless:
             y_n = y_n + torch.randn_like(y_n) * sig_y
 
