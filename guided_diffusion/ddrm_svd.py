@@ -218,7 +218,7 @@ class Inpainting(H_functions):
     def __init__(self, channels, img_dim, missing_indices, inpaint_mask, device):
         self.channels = channels
         self.img_dim = img_dim
-        self.s_star = 1.0
+        self.s_max = 1.0
         self._singulars = torch.ones(channels * img_dim ** 2 - missing_indices.shape[0]).to(device)
         self.missing_indices = missing_indices
         self.kept_indices = torch.Tensor([i for i in range(channels * img_dim ** 2) if i not in missing_indices]).to(
@@ -458,7 +458,7 @@ class SRConv(H_functions):
     def __init__(self, kernel, channels, img_dim, device, stride=1):
         self.img_dim = img_dim
         self.channels = channels
-        self.s_star = 0.25
+        self.s_max = 0.25
         self.ratio = stride
         self.mask = torch.ones(1, channels, img_dim, img_dim)
         small_dim = img_dim // stride
@@ -639,7 +639,7 @@ class SRDebug(H_functions):
 
         self.img_dim = img_dim
         self.channels = channels
-        self.s_star = 1.0
+        self.s_max = 1.0
         self.kernel_size = kk
         self.pad_size = 64
         self.d_sqrt = d_sqrt
@@ -817,7 +817,7 @@ class DeblurringGeneral(H_functions):
 
         self.img_dim = img_dim
         self.channels = channels
-        self.s_star = 1.0
+        self.s_max = 1.0
         self.kernel_size = kk
         self.pad_size = 64
 
@@ -914,7 +914,7 @@ class DeblurringDebug(H_functions):
 
         self.img_dim = img_dim
         self.channels = channels
-        self.s_star = 1.0
+        self.s_max = 1.0
         self.kernel_size = kk
         self.pad_size = 64
         self.d_sqrt = d_sqrt
@@ -996,7 +996,7 @@ class MotionBlurOperator(H_functions):
 
         self.img_dim = img_dim
         self.channels = channels
-        self.s_star = 1.0
+        self.s_max = 1.0
         self.kernel_size = kk
         self.pad_size = 64
         # self.pad_size = 0

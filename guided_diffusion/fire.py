@@ -9,7 +9,7 @@ class FIRE:
         self.A = A
         self.v_min = v_min
         self.rho = rho
-        self.singular_match = A.s_star
+        self.singular_match = A.s_max
         self.gamma_model = gamma_model
         self.var_model = 1 / gamma_model
         self.model = model

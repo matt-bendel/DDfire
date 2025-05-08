@@ -51,7 +51,6 @@ class DDfire:
         self.vp_ddim_prec = vp_ddim_prec
         self.alpha_bars = 1 / (1 + 1 / self.vp_ddim_prec)
         self.fire_runner = FIRE(ref_tensor, vp_prec, model, A, rho, 1 / vp_prec[0], fire_config)
-        self.edm_sample = fire_config['use_edm']
 
     def run_bisection_search(self, vp_ddim_prec):
         # set gam_tgt using delta, the fraction of 1-iter steps
@@ -104,41 +103,11 @@ class DDfire:
         for k in pbar:
             fire_iters = int(self.N_k[k])
             fire_prec = self.vp_ddim_prec[k]
-            if self.edm_sample:
-                # Abuse of variable, eta becomes DDIM gamma here...
-                fire_var = 1 / fire_prec
-                fire_sig = np.sqrt(fire_var)
-                fire_sig_hat = (1 + self.eta) * fire_sig
-                fire_prec = 1 / (fire_sig_hat ** 2)
-
             E_x_0_g_x_t_y = self.fire_runner.run_fire(x_t, y, sig_y, fire_prec, fire_iters, first_k=k == self.K - 1,
                                                       ve_init=self.edm_sample, quantized_t=self.quantize_ddim)
-            if self.edm_sample:
-                x_t = self.edm_update(x_t * fire_sig_hat if k == self.K - 1 else x_t, E_x_0_g_x_t_y, k)
-            else:
-                x_t = self.ddim_update(x_t, E_x_0_g_x_t_y, k)
+            x_t = self.ddim_update(x_t, E_x_0_g_x_t_y, k)
 
         return x_t.clamp(min=-1., max=1.)
-
-    def edm_update(self, x_t, E_x_0_g_x_t_y, k):
-        alpha_bar = self.alpha_bars[k]
-        alpha_bar_prev = 1. if k - 1 < 0 else self.alpha_bars[k - 1]
-
-        sig = np.sqrt((1 - alpha_bar) / alpha_bar)
-        sig_hat = (1 + self.eta) * sig
-        sig_prev = np.sqrt((1 - alpha_bar_prev) / alpha_bar_prev)
-        sig_hat_prev = (1 + self.eta) * sig_prev
-
-        new_noise_sig = np.sqrt(sig_hat_prev ** 2 - sig_prev ** 2)
-        noise = torch.randn_like(x_t)
-
-        x_t = sig_prev * x_t / sig_hat
-        x_t += (1 - sig_prev / sig_hat) * E_x_0_g_x_t_y
-
-        if k != 0:
-            x_t += new_noise_sig * noise
-
-        return x_t
 
     def ddim_update(self, x_t, E_x_0_g_x_t_y, k):
         alpha_bar = self.alpha_bars[k]
