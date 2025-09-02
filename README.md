@@ -1,6 +1,7 @@
-# Solving Inverse Problems using Diffusion with Fast Iterative Renoising [[arXiv]](https://arxiv.org/pdf/2501.17468)
+# Solving Inverse Problems using Diffusion with Fast Iterative Renoising [[arXiv]](https://arxiv.org/pdf/2501.17468) [[OpenReview]](https://openreview.net/forum?id=RZv8FcQDPW)
 
 Official PyTorch implementation of Solving Inverse Problems using Diffusion with Fast Iterative Renoising. Code modified from DPS.
+Our code for Phase Retrieval can be found [here](https://github.com/Saurav-K-Shastri/DDfire-PR).
 
 by Matthew Bendel, Saurav Shastri, Rizwan Ahmad, and Philip Schniter.
 
