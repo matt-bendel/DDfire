@@ -2,6 +2,7 @@
 
 Official PyTorch implementation of Solving Inverse Problems using Diffusion with Fast Iterative Renoising. Code modified from DPS.
 Our code for Phase Retrieval can be found [here](https://github.com/Saurav-K-Shastri/DDfire-PR).
+Additionally, our DDfire code for accelerated MRI reconstruction can be found [here](https://github.com/matt-bendel/DDfire-MRI).
 
 by Matthew Bendel, Saurav Shastri, Rizwan Ahmad, and Philip Schniter.
 
